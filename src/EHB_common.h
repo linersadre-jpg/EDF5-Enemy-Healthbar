@@ -104,7 +104,9 @@ struct Config {
 	int      rayFilter      = 0x16;    // 射线 filterInfo：0x16=只打地图/建筑/地形
 	float    occlBackoff    = 0.0f;    // 射线终点回收距离（米）；0=保持原行为（实测遮挡正常）
 	int      occlIgnoreChars= 1;       // 1 = 角色单位（含友军）不算遮挡，只有地图/建筑才挡血条
-	int      occlReuse      = 2;       // 遮挡结果分帧复用：同一对象每 N 帧才重投一次射线（1=每帧都投）
+	int      occlReuse      = 2;
+	float    occlSelfFrac   = 0.90f;   // 命中比例 >= 该值视为打到目标自身，不算遮挡（大型建筑型敌人必须放宽）       // 遮挡结果分帧复用：同一对象每 N 帧才重投一次射线（1=每帧都投）
+	int      extraObjectScan= 0;       // 1 = 分帧扫描"带血量块"的表外目标（如传送塔）；2 = 并绘制出来
 	uint32_t colorMid       = 0xFFFF00;// 中等血量颜色（黄）
 	uint32_t colorLow       = 0xFF0000;// 低血量颜色（红）
 	float    lowHpPct       = 60.0f;   // 低于该百分比用 colorMid

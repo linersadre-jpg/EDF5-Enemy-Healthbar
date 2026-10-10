@@ -12,6 +12,7 @@
 #include <dxgi.h>      // 必须用真正的 DXGI_SWAP_CHAIN_DESC：sizeof 是 72 不是 64
 
 #include "EHB_common.h"
+#include "EHB_damageable.h"
 #include "PluginAPI.h"
 
 #include <cmath>
@@ -222,6 +223,8 @@ void IniWriteDefault(const std::string& path) {
 		"; 遮挡结果分帧复用：同一对象每 N 帧才重新投一次射线，中间沿用上次结果。\r\n"
 		"; 1 = 每帧都投（最准）；2~3 可省 1/2~1/3 的射线开销，肉眼几乎无差别。\r\n"
 		"OcclusionReuse=2\r\n"
+		"; 命中比例 >= 该值视为打到目标自身，不算遮挡（传送塔这类大型建筑型敌人必须放宽，否则会被自己挡住）\r\n"
+		"OcclusionSelfFrac=0.90\r\n"
 		"; ---- 颜色随血量 ----\r\n"
 		"; 血量 <= LowHpPercent 用 BarColorMid；<= CriticalHpPercent 用 BarColorLow\r\n"
 		"BarColorMid=FFFF00\r\n"
@@ -277,6 +280,9 @@ void LoadConfig(const std::string& path) {
 	g_cfg.occlReuse    = static_cast<int>(ParseInt(IniGet(path, "OcclusionReuse", "2"), 2));
 	if (g_cfg.occlReuse < 1)  g_cfg.occlReuse = 1;
 	if (g_cfg.occlReuse > 10) g_cfg.occlReuse = 10;
+	g_cfg.occlSelfFrac = ParseFloat(IniGet(path, "OcclusionSelfFrac", "0.90"), 0.90f);
+	if (g_cfg.occlSelfFrac < 0.5f) g_cfg.occlSelfFrac = 0.5f;
+	if (g_cfg.occlSelfFrac > 0.999f) g_cfg.occlSelfFrac = 0.999f;
 	g_cfg.colorMid    = ParseColor(IniGet(path, "BarColorMid", "FFFF00"), 0xFFFF00);
 	g_cfg.colorLow    = ParseColor(IniGet(path, "BarColorLow", "FF0000"), 0xFF0000);
 	g_cfg.lowHpPct    = ParseFloat(IniGet(path, "LowHpPercent", "60"), 60.0f);
@@ -293,8 +299,10 @@ void LoadConfig(const std::string& path) {
 	if (g_cfg.overlayMode != 0 && g_cfg.overlayMode != 1) g_cfg.overlayMode = 0;
 	g_cfg.debug        = ParseInt(IniGet(path, "Debug", "1"), 1) != 0;
 	g_cfg.nativeProbe  = static_cast<int>(ParseInt(IniGet(path, "NativeProbe", "0"), 0));
-	if (g_cfg.nativeProbe < 0 || g_cfg.nativeProbe > 3) g_cfg.nativeProbe = 0;
+	if (g_cfg.nativeProbe < 0 || g_cfg.nativeProbe > 4) g_cfg.nativeProbe = 0;
 	g_cfg.drawBars     = ParseInt(IniGet(path, "DrawBars", "1"), 1) != 0;
+	g_cfg.extraObjectScan = static_cast<int>(ParseInt(IniGet(path, "ExtraObjectScan", "0"), 0));
+	if (g_cfg.extraObjectScan < 0 || g_cfg.extraObjectScan > 2) g_cfg.extraObjectScan = 0;
 
 	if (g_cfg.barWidth  < 4)   g_cfg.barWidth = 4;
 	if (g_cfg.barWidth  > 400) g_cfg.barWidth = 400;
@@ -1167,6 +1175,191 @@ static int OcclAdd(std::uintptr_t o) {
 	return i;
 }
 
+// 队伍表全量 dump：NativeProbe=4 时，把每个队伍里的对象连同类名/血量/坐标打出来，
+// 用来排查"某类敌人（例如传送塔）为什么不显示血条"。
+static void DebugDumpTeams(std::uintptr_t player) {
+	if (!g_cfg.debug || g_cfg.nativeProbe < 4) return;
+	if (g_nativeProbeLines >= 600) return;
+	if ((g_frame % 600) != 0) return;
+	if (!player) return;
+
+	std::uintptr_t mgr = 0, rows = 0;
+	if (!RdPtr(g_base + off::kTeamManagerPtr, mgr) || !mgr) return;
+	if (!RdPtr(mgr + off::kRows, rows) || !rows) return;
+	std::int32_t teamCount = 0;
+	if (!RdI(mgr + off::kCount, teamCount) || teamCount <= 0 || teamCount > 32) return;
+	std::int32_t myTeam = -1;
+	RdI(player + off::kTeam, myTeam);
+
+	std::int32_t myRel[32];
+	for (int i = 0; i < 32; ++i) myRel[i] = -1;
+	if (myTeam >= 0 && myTeam < teamCount) {
+		std::uintptr_t relPtr = 0;
+		if (RdPtr(rows + static_cast<std::size_t>(myTeam) * off::kRowStride + off::kRelations, relPtr) && relPtr) {
+			for (int t = 0; t < teamCount; ++t) RdI(relPtr + static_cast<std::size_t>(t) * 4, myRel[t]);
+		}
+	}
+
+	Log("[team] 队伍数=%d 玩家队伍=%d（关系 2=敌 1=友 0=中立）", teamCount, myTeam);
+	++g_nativeProbeLines;
+	for (int t = 0; t < teamCount && g_nativeProbeLines < 600; ++t) {
+		const std::uintptr_t row = rows + static_cast<std::size_t>(t) * off::kRowStride;
+		std::uintptr_t head = 0;
+		RdPtr(row + off::kRowHead, head);
+		std::uintptr_t objs[64];
+		const int n = CollectTeamObjects(head, objs, 64);
+
+		// 先打"类名分布"（完整覆盖该队伍的所有对象，不占多少行）——
+		// 这是判断"某类敌人是否根本不在队伍表里"的关键
+		std::string hName[16];
+		int hCnt[16] = {};
+		int hn = 0;
+		for (int i = 0; i < n; ++i) {
+			const std::string c = ShortClassName(objs[i]);
+			int k = -1;
+			for (int j = 0; j < hn; ++j) {
+				if (hName[j] == c) { k = j; break; }
+			}
+			if (k < 0) {
+				if (hn >= 16) continue;
+				k = hn++;
+				hName[k] = c;
+			}
+			hCnt[k]++;
+		}
+		std::string hist;
+		for (int j = 0; j < hn; ++j) {
+			if (j) hist += ", ";
+			hist += hName[j] + " x" + std::to_string(hCnt[j]);
+		}
+		Log("[team] 队伍 %d（对玩家关系=%d）对象=%d 类名分布: %s", t, myRel[t], n, hist.c_str());
+		++g_nativeProbeLines;
+		for (int i = 0; i < n && i < 8 && g_nativeProbeLines < 600; ++i) {
+			LogObjectFields("  队伍对象", objs[i]);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// "表外目标"扫描：传送塔这类对象**带血量块但不在冲突对象表里**，队伍表遍历看不到。
+// 做法：分帧扫描进程私有内存，找虚表命中 EHB_damageable.h 那张表（= 带血量块的类）的对象，
+//       再做字段校验。每帧有字节预算，不会造成单帧卡顿。
+//       ExtraObjectScan=1 只记录；=2 另说（绘制留到验证通过后再接）。
+// ---------------------------------------------------------------------------
+static int            g_exFound = 0;
+static std::uintptr_t g_exPtr[64] = {};
+static std::uintptr_t g_exAddr = 0;
+static bool           g_exInit = false;
+static bool           g_exDone = false;
+static int            g_exNextScan = 0;  // 下次重扫的帧号（传送塔可能后生成）
+static double         g_exBytes = 0;      // 已扫描字节
+static int            g_exRegions = 0;    // 已扫描区域数
+static int            g_exVtRange = 0;    // 落在虚表地址范围内的值
+static int            g_exVtHit = 0;      // 其中命中白名单的值
+
+static bool IsDamageableVtable(std::uintptr_t vtRva) {
+	int lo = 0, hi = static_cast<int>(ehb::kDamageableVtableCount) - 1;
+	while (lo <= hi) {
+		const int m = (lo + hi) / 2;
+		const std::uint32_t v = ehb::kDamageableVtables[m];
+		if (v == vtRva) return true;
+		if (v < vtRva) lo = m + 1;
+		else hi = m - 1;
+	}
+	return false;
+}
+
+// 字段校验：血量与坐标都要合理，避免把"碰巧存着虚表数值的随机内存"当成对象
+static bool LooksLikeDamageableRaw(std::uintptr_t o) {
+	if (!Readable(reinterpret_cast<const void*>(o), 0x300)) return false;
+	float mx = 0, cur = 0, x = 0, y = 0, z = 0;
+	if (!RdF(o + off::kMaxHp, mx) || !RdF(o + off::kCurHp, cur)) return false;
+	if (!(mx > 0.0f && mx < 1.0e8f)) return false;
+	if (!(cur >= 0.0f && cur <= mx + 0.5f)) return false;
+	if (!RdF(o + off::kPos, x) || !RdF(o + off::kPos + 4, y) || !RdF(o + off::kPos + 8, z)) return false;
+	if (std::fabs(x) > 1.0e5f || std::fabs(y) > 1.0e5f || std::fabs(z) > 1.0e5f) return false;
+	return true;
+}
+
+// 裸函数：内部不得出现需要析构的 C++ 对象，否则 __try 不可用
+static int ScanChunkRaw(const std::uintptr_t* p, std::size_t n, std::uintptr_t base,
+                        std::uintptr_t* out, int cap, int have) {
+	int found = have;
+	__try {
+		for (std::size_t i = 0; i + 48 < n && found < cap; ++i) {
+			const std::uintptr_t v = p[i];
+			if (v < g_base + 0xC97000 || v >= g_baseEnd) continue;
+			if (!IsDamageableVtable(v - g_base)) continue;
+			const std::uintptr_t o = base + i * sizeof(std::uintptr_t);
+			if (!LooksLikeDamageableRaw(o)) continue;
+			int dup = 0;
+			for (int k = 0; k < found; ++k) { if (out[k] == o) { dup = 1; break; } }
+			if (!dup) out[found++] = o;
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		return found;
+	}
+	return found;
+}
+
+static void ExtraScanStep(bool inMission) {
+	// 必须"已经在关卡里"才扫：否则会在读图阶段就把内存扫完，那时对象还不存在（实测命中 0）
+	if (!inMission) { g_exInit = false; g_exDone = false; g_exFound = 0; return; }
+	if (g_cfg.extraObjectScan <= 0) return;
+	if (g_exDone) { if (g_frame < g_exNextScan) return; g_exDone = false; g_exInit = false; }
+	SYSTEM_INFO si = {};
+	GetSystemInfo(&si);
+	const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
+	const std::uintptr_t hi = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
+	if (!g_exInit) {
+		g_exAddr = lo;
+		g_exInit = true;
+		g_exBytes = 0; g_exRegions = 0; g_exVtRange = 0; g_exVtHit = 0;
+		Log("[extra] 开始扫描（帧 %d）", g_frame);
+	}
+	std::size_t budget = 16u * 1024u * 1024u;   // 每帧最多扫 16MB
+	while (budget > 0 && g_exFound < 64 && g_exAddr < hi) {
+		MEMORY_BASIC_INFORMATION mbi = {};
+		if (VirtualQuery(reinterpret_cast<LPCVOID>(g_exAddr), &mbi, sizeof mbi) != sizeof mbi) break;
+		const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+		std::size_t sz = static_cast<std::size_t>(mbi.RegionSize);
+		g_exAddr = base + sz;
+		const bool ok = (mbi.State == MEM_COMMIT) && (mbi.Type == MEM_PRIVATE) && sz >= 8 &&
+		                !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+		                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY));
+		if (ok) {
+			if (sz > 32u * 1024u * 1024u) sz = 32u * 1024u * 1024u;   // 超大区域只扫前 32MB
+			const std::size_t take = (sz < budget) ? sz : budget;
+			g_exFound = ScanChunkRaw(reinterpret_cast<const std::uintptr_t*>(base),
+			                         take / sizeof(std::uintptr_t), base, g_exPtr, 64, g_exFound);
+			budget -= take;
+		}
+	}
+	if (!g_exDone && (g_frame % 120) == 0 && g_exRegions > 0) {
+		Log("[extra] 扫描中：已扫 %.1f MB / 区域 %d / 虚表域候选 %d / 表内命中 %d / 通过校验 %d",
+		    g_exBytes / 1048576.0, g_exRegions, g_exVtRange, g_exVtHit, g_exFound);
+	}
+	if (g_exAddr >= hi) {
+		g_exDone = true;
+		g_exNextScan = g_frame + 900;   // 15 秒后重扫一次（新生成的目标也能被找到）
+		Log("[extra] 扫描完成：已扫 %.1f MB / 区域 %d / 虚表域候选 %d / 表内命中 %d / 通过校验 %d",
+		    g_exBytes / 1048576.0, g_exRegions, g_exVtRange, g_exVtHit, g_exFound);
+		for (int i = 0; i < g_exFound; ++i) {
+			const std::uintptr_t o = g_exPtr[i];
+			float mx = 0, cur = 0, x = 0, y = 0, z = 0;
+			RdF(o + off::kMaxHp, mx);
+			RdF(o + off::kCurHp, cur);
+			RdF(o + off::kPos, x);
+			RdF(o + off::kPos + 4, y);
+			RdF(o + off::kPos + 8, z);
+			Log("[extra] %p class=%s max=%.1f cur=%.1f pos=(%.0f,%.0f,%.0f)",
+			    reinterpret_cast<void*>(o), ClassTag(o).c_str(), static_cast<double>(mx),
+			    static_cast<double>(cur), static_cast<double>(x), static_cast<double>(y),
+			    static_cast<double>(z));
+		}
+	}
+}
+
 static void CollectFrame() {
 	ToggleHotkey();
 
@@ -1228,6 +1421,8 @@ static void CollectFrame() {
 		Log("[life] 关卡切换（队伍表清空）：已清空遮挡缓存与取证表");
 	}
 	g_prevObjCount = n;
+	DebugDumpTeams(player);
+	ExtraScanStep(n > 0 && player != 0);
 
 	// 射线刚出过异常：那个世界指针很可能已经失效，丢掉重找
 	if (InterlockedExchange(&g_worldRestale, 0) != 0 && g_world) {
@@ -1341,7 +1536,7 @@ static void CollectFrame() {
 				}
 				float frac = -1.0f;
 				std::uintptr_t hitObj = 0;
-				if (SafeCastRay(g_world, eye, to, &frac, &hitObj) && frac < 0.995f) {
+				if (SafeCastRay(g_world, eye, to, &frac, &hitObj) && frac < g_cfg.occlSelfFrac) {
 					const bool isChar = HitLooksLikeCharacter(hitObj);
 					if (g_cfg.debug && g_occlDropLog < 40) {
 						++g_occlDropLog;
@@ -1498,7 +1693,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 	LogInit();
 	Log("================ EDF5 敌人血条 MOD ================");
 	Log("base=%p end=%p dir=%s", reinterpret_cast<void*>(g_base), reinterpret_cast<void*>(g_baseEnd), g_dir.c_str());
-	Log("构建标记: EHB-1.1.0 (性能版：Readable 区间缓存；覆盖层只擦旧条/只传脏区/内容未变则跳过；DrawFps=0 跟随游戏帧)");
+	Log("构建标记: EHB-1.2.0 (性能版：Readable 区间缓存；覆盖层只擦旧条/只传脏区/内容未变则跳过；DrawFps=0 跟随游戏帧)");
 	Log("尺寸自检: DXGI_SWAP_CHAIN_DESC=%zu Collector=%zu RayQuery=%zu BarRect=%zu",
 	    sizeof(DXGI_SWAP_CHAIN_DESC), sizeof(Collector), sizeof(RayQuery), sizeof(BarRect));
 
@@ -1545,7 +1740,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
 extern "C" BOOL __declspec(dllexport) EDFMLAPI EML5_Load(PluginInfo* pluginInfo) {
 	pluginInfo->infoVersion = PluginInfo::MaxInfoVer;
 	pluginInfo->name        = "EDF5 Enemy Healthbar";
-	pluginInfo->version     = PLUG_VER(1, 0, 0, 0);
+	pluginInfo->version     = PLUG_VER(1, 2, 0, 0);
 
 	char path[MAX_PATH] = {};
 	GetModuleFileNameA(g_self, path, MAX_PATH);

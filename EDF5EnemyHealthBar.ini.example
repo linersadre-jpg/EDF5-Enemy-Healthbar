@@ -42,6 +42,8 @@ OcclusionCheck=1
 OcclusionIgnoreCharacters=1
 ; 遮挡结果分帧复用：同一对象每 N 帧才重投一次射线（1=每帧都投；2~3 省 1/2~1/3 射线开销）
 OcclusionReuse=2
+; 命中比例 >= 该值算打到目标自身，不算遮挡（传送塔这类大型建筑型敌人需要 0.90）
+OcclusionSelfFrac=0.90
 ; 射线终点往回收的距离（米）。0 = 保持默认（实测判定正常），一般不用改
 OcclusionBackoff=0.0
 ; 最大显示距离（米）；0 = 不限
@@ -87,3 +89,6 @@ Debug=0
 NativeProbe=0
 ; 0 = 不画我们自绘的血条（采集照常），用于对照测试；正常玩保持 1
 DrawBars=1
+
+; 1 = 分帧扫描"带血量块"的表外目标（如传送塔），只记录不绘制；0 = 关
+ExtraObjectScan=0

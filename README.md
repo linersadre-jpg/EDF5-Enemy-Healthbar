@@ -30,7 +30,7 @@ Native x64 C++ plugin loaded by [EDFModLoader](https://github.com/BlueAmulet/EDF
 >
 > Bug reports with the log file (`Mods\Plugins\EDF5EnemyHealthBar.log`, set `Debug=1`) are welcome.
 
-**Current version: `v1.1.0-pre` — pre-release, see [CHANGELOG.md](CHANGELOG.md).**
+**Current version: `v1.2.0-pre` — pre-release, see [CHANGELOG.md](CHANGELOG.md).**
 
 ---
 
@@ -84,6 +84,7 @@ E:\SteamLibrary\steamapps\common\EARTH DEFENSE FORCE 5\Mods\Plugins\EDF5EnemyHea
 | `OcclusionCheck` | 1 | 遮挡检测总开关 |
 | `OcclusionIgnoreCharacters` | 1 | 友军/角色单位不算遮挡 |
 | `OcclusionReuse` | 2 | 遮挡结果分帧复用（同一对象每 N 帧才重投射线） |
+| `OcclusionSelfFrac` | 0.90 | 命中比例 ≥ 该值视为打到目标自身，不算遮挡（大型建筑型目标必需） |
 | `DrawFps` | 0 | 覆盖层重绘上限；`0` = 不限，跟随游戏帧 |
 | `MaxBars` | 64 | 同屏最多画几条 |
 | `Debug` | 1 | 往同目录写日志（日常玩建议设 0） |
@@ -111,13 +112,15 @@ copy build\EDF5EnemyHealthBar.dll "…\EARTH DEFENSE FORCE 5\Mods\Plugins\"
 | [docs/EDF5-遮挡射线定位.md](docs/EDF5-遮挡射线定位.md) | 遮挡射线逆向：入口、query/collector 布局、per-thread Havok 现场 |
 | [docs/EDF5-P0-静态定位结果.md](docs/EDF5-P0-静态定位结果.md) | 对象偏移、队伍表、伤害函数、血量字段 |
 | [docs/EDF5-复用原生NPC血条-调研与方案.md](docs/EDF5-复用原生NPC血条-调研与方案.md) | "改用游戏原生血条"的调研与被证伪过程 |
+| [docs/EDF5-排查手册-某类目标没显示血条.md](docs/EDF5-排查手册-某类目标没显示血条.md) | **排查手册**：某类目标没血条时的三步判别法 + 传送塔案例 |
 | [docs/P0探针-使用说明.md](docs/P0探针-使用说明.md) | 只读探针的用法 |
 
 ### 已知限制
 
 1. **独占全屏下看不到血条**（分层窗口方案的固有代价）→ 用无边框窗口 / 窗口化。
 2. 联机、载具内、瞄准镜相机**均未验证**（见上文免责声明）。
-3. 血量的"总有效生命值 vs 部位耐久"口径，已用反汇编证据确认读的是前者，
+3. ~~传送塔这类"非冲突对象"没有血条~~ —— 已解决：传送塔的类名是 `GeneratorPoll`，它在敌方队伍里，缺条原因是遮挡自命中（见 `OcclusionSelfFrac`）。
+4. 血量的"总有效生命值 vs 部位耐久"口径，已用反汇编证据确认读的是前者，
    但在多部位敌人（青蛙人 / 小灰人）上的**实机确认仍未完成**。
 
 ## License
