@@ -228,6 +228,25 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
 			if (!haveBox) { Sleep(50); continue; }
 		}
 
+		// 游戏失去焦点（切到桌面/别的程序）就完全停画并隐藏覆盖层，不再空跑。
+		// 判定方式：前台窗口的进程 PID 是否就是本进程（本 DLL 运行在游戏进程里）。
+		// GetForegroundWindow 返回 NULL 时按"仍有焦点"处理，避免误隐藏。
+		{
+			const HWND fg = GetForegroundWindow();
+			DWORD fgPid = 0;
+			if (fg) GetWindowThreadProcessId(fg, &fgPid);
+			const bool focused = (fg == nullptr) || (fgPid == GetCurrentProcessId());
+			if (!focused) {
+				if (placed) {
+					ShowWindow(g_overlay, SW_HIDE);
+					placed = false;
+					firstUpload = true;   // 重新出现时整张重传，避免残留旧条
+				}
+				Sleep(50);
+				continue;
+			}
+		}
+
 		// 位图按客户区大小重建（只在尺寸变化时重建；持久 DIB，不再每帧新建）
 		bool fresh = false;
 		if (cw != bufW || ch != bufH || !memDC) {
@@ -336,8 +355,9 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
 				if (bh < 1) bh = 1;
 				const int fillW = static_cast<int>(std::floor(static_cast<float>(bw) * b.frac + 0.5f));
 
-				if (b.outline) {
-					FillRect(buf, cw, ch, bx - 1, by - 1, bx + bw, by + bh, 0x101010, 200);
+				const int m = b.outline ? (g_cfg.barOutlinePx > 0 ? g_cfg.barOutlinePx : 1) : 0;
+				if (m > 0) {
+					FillRect(buf, cw, ch, bx - m, by - m, bx + bw + m - 1, by + bh + m - 1, 0x101010, 200);
 				}
 				if (g_cfg.bgAlpha > 0) {
 					FillRect(buf, cw, ch, bx, by, bx + bw - 1, by + bh - 1, 0x000000, g_cfg.bgAlpha);
@@ -347,7 +367,6 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
 				}
 
 				if (newCount < kMaxBars) {
-					const int m = b.outline ? 1 : 0;
 					newX0[newCount] = bx - m;
 					newY0[newCount] = by - m;
 					newX1[newCount] = bx + bw + m;

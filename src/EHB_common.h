@@ -89,6 +89,7 @@ struct Config {
 	int      barWidth       = 50;
 	int      barHeight      = 5;
 	int      barOutline     = 1;       // 细描边（深色 1px），提升可读性
+	int      barOutlinePx   = 2;       // 描边厚度（像素）
 	int      bgAlpha        = 0;       // 背景不透明度 0..255，0 = 不画背景
 	float    maxViewAngle   = 60.0f;   // 视野半角（度）
 	int      occlusion      = 1;       // 遮挡检测
@@ -104,6 +105,13 @@ struct Config {
 	float    occlBackoff    = 0.0f;    // 射线终点回收距离（米）；0=保持原行为（实测遮挡正常）
 	int      occlIgnoreChars= 1;       // 1 = 角色单位（含友军）不算遮挡，只有地图/建筑才挡血条
 	int      occlReuse      = 2;       // 遮挡结果分帧复用：同一对象每 N 帧才重投一次射线（1=每帧都投）
+	uint32_t colorMid       = 0xFFFF00;// 中等血量颜色（黄）
+	uint32_t colorLow       = 0xFF0000;// 低血量颜色（红）
+	float    lowHpPct       = 60.0f;   // 低于该百分比用 colorMid
+	float    critHpPct      = 20.0f;   // 低于该百分比用 colorLow
+	int      widthByHp      = 0;       // 1 = 血条长度随最大血量放大（sqrt，夹到 1~3 倍）
+	int      scaleByDist    = 0;       // 1 = 血条随距离缩放（越远越小，夹到 0.5~1 倍）
+	float    distRef        = 30.0f;   // 距离缩放的参考距离（米）
 	int      overlayMode    = 0;       // 0=跟随游戏窗口 1=覆盖整个桌面
 	int      debug          = 0;
 	int      nativeProbe    = 0;       // C1 只读探针：1=dump 字段/容器 2=再加 SoldierBase 测试 3=再加虚表扫描

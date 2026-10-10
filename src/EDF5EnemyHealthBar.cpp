@@ -175,12 +175,14 @@ void IniWriteDefault(const std::string& path) {
 		"; ---- 外观 ----\r\n"
 		"; 血条颜色 RRGGBB\r\n"
 		"BarColor=00FF00\r\n"
-		"BarWidth=50\r\n"
-		"BarHeight=5\r\n"
-		"; 1 = 给血条加 1px 深色描边，在明亮背景上更容易看清\r\n"
+		"BarWidth=42\r\n"
+		"BarHeight=7\r\n"
+		"; 1 = 给血条加深色描边（厚度见 BarOutlinePx）\r\n"
 		"BarOutline=1\r\n"
-		"; 背景不透明度 0..255；0 = 完全不画背景\r\n"
-		"BackgroundAlpha=0\r\n"
+		"; 描边厚度（像素）\r\n"
+		"BarOutlinePx=2\r\n"
+		"; 背景不透明度 0..255；0 = 不画背景。建议 140~180：未填充部分是深色，对比度好很多\r\n"
+		"BackgroundAlpha=150\r\n"
 		"\r\n"
 		"; ---- 显示条件 ----\r\n"
 		"; 视野半角（度）\r\n"
@@ -220,6 +222,17 @@ void IniWriteDefault(const std::string& path) {
 		"; 遮挡结果分帧复用：同一对象每 N 帧才重新投一次射线，中间沿用上次结果。\r\n"
 		"; 1 = 每帧都投（最准）；2~3 可省 1/2~1/3 的射线开销，肉眼几乎无差别。\r\n"
 		"OcclusionReuse=2\r\n"
+		"; ---- 颜色随血量 ----\r\n"
+		"; 血量 <= LowHpPercent 用 BarColorMid；<= CriticalHpPercent 用 BarColorLow\r\n"
+		"BarColorMid=FFFF00\r\n"
+		"BarColorLow=FF0000\r\n"
+		"LowHpPercent=60\r\n"
+		"CriticalHpPercent=20\r\n"
+		"; 1 = 血条长度随最大血量放大（以普通兵 81 血为基准，sqrt 缩放并夹到 1~3 倍）\r\n"
+		"BarWidthByMaxHp=0\r\n"
+		"; 1 = 血条随距离缩小（以 DistanceRef 米为基准，夹到 0.5~1 倍）\r\n"
+		"BarScaleByDistance=0\r\n"
+		"DistanceRef=30.0\r\n"
 		"; 覆盖层定位方式：0 = 跟随游戏窗口；1 = 覆盖整个桌面（游戏窗口找不准时用这个）\r\n"
 		"OverlayMode=0\r\n"
 		"; 1 = 往 DLL 同目录写调试日志（首次测试建议保持 1）\r\n"
@@ -242,6 +255,9 @@ void LoadConfig(const std::string& path) {
 	g_cfg.barWidth     = static_cast<int>(ParseInt(IniGet(path, "BarWidth", "50"), 50));
 	g_cfg.barHeight    = static_cast<int>(ParseInt(IniGet(path, "BarHeight", "5"), 5));
 	g_cfg.barOutline   = ParseInt(IniGet(path, "BarOutline", "1"), 1) != 0;
+	g_cfg.barOutlinePx = static_cast<int>(ParseInt(IniGet(path, "BarOutlinePx", "2"), 2));
+	if (g_cfg.barOutlinePx < 0) g_cfg.barOutlinePx = 0;
+	if (g_cfg.barOutlinePx > 4) g_cfg.barOutlinePx = 4;
 	g_cfg.bgAlpha      = static_cast<int>(ParseInt(IniGet(path, "BackgroundAlpha", "0"), 0));
 	g_cfg.maxViewAngle = ParseFloat(IniGet(path, "MaxViewAngle", "60"), 60.0f);
 	g_cfg.occlusion    = ParseInt(IniGet(path, "OcclusionCheck", "1"), 1) != 0;
@@ -261,6 +277,18 @@ void LoadConfig(const std::string& path) {
 	g_cfg.occlReuse    = static_cast<int>(ParseInt(IniGet(path, "OcclusionReuse", "2"), 2));
 	if (g_cfg.occlReuse < 1)  g_cfg.occlReuse = 1;
 	if (g_cfg.occlReuse > 10) g_cfg.occlReuse = 10;
+	g_cfg.colorMid    = ParseColor(IniGet(path, "BarColorMid", "FFFF00"), 0xFFFF00);
+	g_cfg.colorLow    = ParseColor(IniGet(path, "BarColorLow", "FF0000"), 0xFF0000);
+	g_cfg.lowHpPct    = ParseFloat(IniGet(path, "LowHpPercent", "60"), 60.0f);
+	g_cfg.critHpPct   = ParseFloat(IniGet(path, "CriticalHpPercent", "20"), 20.0f);
+	if (g_cfg.lowHpPct  < 1.0f)  g_cfg.lowHpPct = 1.0f;
+	if (g_cfg.lowHpPct  > 100.0f) g_cfg.lowHpPct = 100.0f;
+	if (g_cfg.critHpPct < 1.0f)  g_cfg.critHpPct = 1.0f;
+	if (g_cfg.critHpPct > g_cfg.lowHpPct) g_cfg.critHpPct = g_cfg.lowHpPct;
+	g_cfg.widthByHp   = ParseInt(IniGet(path, "BarWidthByMaxHp", "0"), 0) != 0;
+	g_cfg.scaleByDist = ParseInt(IniGet(path, "BarScaleByDistance", "0"), 0) != 0;
+	g_cfg.distRef     = ParseFloat(IniGet(path, "DistanceRef", "30.0"), 30.0f);
+	if (g_cfg.distRef < 1.0f) g_cfg.distRef = 1.0f;
 	g_cfg.overlayMode  = static_cast<int>(ParseInt(IniGet(path, "OverlayMode", "0"), 0));
 	if (g_cfg.overlayMode != 0 && g_cfg.overlayMode != 1) g_cfg.overlayMode = 0;
 	g_cfg.debug        = ParseInt(IniGet(path, "Debug", "1"), 1) != 0;
@@ -1339,14 +1367,31 @@ static void CollectFrame() {
 
 		BarRect& b = tmp[count++];
 		NoteBar(o, maxHp, curHp);
-		b.w = static_cast<float>(g_cfg.barWidth);
-		b.h = static_cast<float>(g_cfg.barHeight);
+		float bw = static_cast<float>(g_cfg.barWidth);
+		float bh = static_cast<float>(g_cfg.barHeight);
+		if (g_cfg.widthByHp) {                       // 血条长度随最大血量（sqrt，夹 1~3 倍）
+			float s = std::sqrt(maxHp / 81.0f);
+			if (s < 1.0f) s = 1.0f;
+			if (s > 3.0f) s = 3.0f;
+			bw *= s;
+		}
+		if (g_cfg.scaleByDist && g_cfg.distRef > 1.0f) {   // 越远越小（夹 0.5~1 倍）
+			float s = g_cfg.distRef / (pa.depth > 1.0f ? pa.depth : 1.0f);
+			if (s < 0.5f) s = 0.5f;
+			if (s > 1.0f) s = 1.0f;
+			bw *= s;
+			bh *= s;
+		}
+		b.w = bw;
+		b.h = bh;
 		b.x = pa.sx - b.w * 0.5f;
 		b.y = pa.sy - b.h - 2.0f;
 		b.frac = curHp / maxHp;
 		if (b.frac < 0.0f) b.frac = 0.0f;
 		if (b.frac > 1.0f) b.frac = 1.0f;
-		b.color = g_cfg.color;
+		const float pct = b.frac * 100.0f;
+		b.color = (pct <= g_cfg.critHpPct) ? g_cfg.colorLow
+		        : ((pct <= g_cfg.lowHpPct) ? g_cfg.colorMid : g_cfg.color);
 		b.outline = g_cfg.barOutline ? 1 : 0;
 	}
 
@@ -1407,7 +1452,12 @@ static void TryGetSwapChainWindow(void* sc) {
 static HRESULT STDMETHODCALLTYPE HookPresent(void* swapChain, UINT syncInterval, UINT flags) {
 	const DWORD now = GetTickCount();
 	const DWORD interval = (g_cfg.drawFps > 0) ? (1000u / static_cast<DWORD>(g_cfg.drawFps)) : 0;
-	if (now - g_lastFrame >= interval) {
+	// 游戏失去焦点时不再采集（覆盖层那边也已停画并隐藏），省掉渲染线程上的射线与遍历开销
+	HWND fgWnd = GetForegroundWindow();
+	DWORD fgPid = 0;
+	if (fgWnd) GetWindowThreadProcessId(fgWnd, &fgPid);
+	const bool gameFocused = (fgWnd == nullptr) || (fgPid == GetCurrentProcessId());
+	if (gameFocused && now - g_lastFrame >= interval) {
 		g_lastFrame = now;
 		++g_frame;
 		if ((g_frame % 120) == 1) TryGetSwapChainWindow(swapChain);
