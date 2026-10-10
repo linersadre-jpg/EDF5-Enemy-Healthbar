@@ -112,6 +112,7 @@ copy build\EDF5EnemyHealthBar.dll "…\EARTH DEFENSE FORCE 5\Mods\Plugins\"
 | [docs/EDF5-遮挡射线定位.md](docs/EDF5-遮挡射线定位.md) | 遮挡射线逆向：入口、query/collector 布局、per-thread Havok 现场 |
 | [docs/EDF5-P0-静态定位结果.md](docs/EDF5-P0-静态定位结果.md) | 对象偏移、队伍表、伤害函数、血量字段 |
 | [docs/EDF5-复用原生NPC血条-调研与方案.md](docs/EDF5-复用原生NPC血条-调研与方案.md) | "改用游戏原生血条"的调研与被证伪过程 |
+| [AGENTS.md](AGENTS.md) | **给接手这个项目的 AI/开发者的说明书**：硬约束、构建部署循环、诊断协议、已知陷阱清单、不要再走的弯路 |
 | [docs/EDF5-排查手册-某类目标没显示血条.md](docs/EDF5-排查手册-某类目标没显示血条.md) | **排查手册**：某类目标没血条时的三步判别法 + 传送塔案例 |
 | [docs/P0探针-使用说明.md](docs/P0探针-使用说明.md) | 只读探针的用法 |
 
