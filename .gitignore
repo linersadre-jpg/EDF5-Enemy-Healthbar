@@ -1,0 +1,28 @@
+# 构建产物（不入库；发布包用 dist/ 里的 zip）
+build/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.map
+*.ilk
+*.log
+*.dmp
+
+# 工具缓存
+tools/.cache/
+__pycache__/
+*.pyc
+
+# 本地版本快照（本地回滚用，不入库）
+snapshots/
+
+# IDE / 系统
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# ��ʱ���
+scripts/_b*.txt
