@@ -48,7 +48,9 @@ extern "C" __declspec(dllexport) bool EDFMLAPI EML5_Load(PluginInfo* info);
 - 名称（暂定）：`EDF5EnemyHealthBar.dll` + `EDF5EnemyHealthBar.ini`
 - 构建：照抄 `edf6-all-forces-nightly\build-ws.cmd` 的直连 `cl/link` 方式（沙箱下 CMake 的 piped stdio 探测会挂）
 - 入口流程：`EML5_Load` → 初始化 ini 与日志 → 识别 EDF5.exe 镜像 → 签名校验 → 全部通过后才安装 hook；校验失败直接 `return false`（保持游戏原样）
-- 兼容性锚点：`EDF5.exe` **无版本资源**，PE `TimeDateStamp = 918027`（无效值），禁止用版本号判断；使用
+- 兼容性锚点：`EDF5.exe` **无版本资源**（禁止用版本号判断），PE `TimeDateStamp = 1561452115 (0x5D11DE53) = 2019-06-25 08:41:55 UTC`；使用
+  > **更正（2026-10-13 实测）**：本文早期把该值记为 `918027`，是**读错**。实测方式：读 DOS 头 `e_lfanew` → COFF 头 `+8` 处的 `TimeDateStamp`，本机得到 `1561452115`。
+  > 教训：**指纹一律以实测 PE 头为准**，不要沿用旧文档里的转述值（知识库/文档间转述会把这个错误传播出去）。
   - 文件哈希：`SHA256 = 3512D2A2E61D532C5D12DC0C5FD1AC61F6743E13349AE21301BB8449DD4BAE5F`（本机当前版本）
   - AOB 签名扫描定位各锚点（同 `Mods\Patches\*.txt` / Patcher 的做法），签名不匹配则拒绝加载并记录日志
 

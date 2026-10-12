@@ -102,7 +102,7 @@ del  "...\Mods\Plugins\EDF5EnemyHealthBar.log"      :: 想要干净日志就先�
 | 对象血量 | `+0x1F4` min / `+0x1F8` max / `+0x1FC` cur（**累积总生命值**口径） | 同上 + `EDF5-敌人血条-MOD-需求修订.md` §11 |
 | 遮挡射线 | `EDF5.exe+0x74F110`，`RayFilter=0x16`，需私有 Havok 现场 | `EDF5-遮挡射线定位.md` |
 | 传送塔的真实类名 | **`.?AVGeneratorPoll@@`**（名字完全不提示"塔"；在敌方队伍里，`max=2637.6`） | `EDF5-排查手册-某类目标没显示血条.md` |
-| exe 指纹 | 19,896,320 字节，`ImageBase 0x140000000`，SHA256 `3512D2A2…` | `EDF5-敌人血条-逆向线索与P0计划.md` |
+| exe 指纹 | 19,896,320 字节，`ImageBase 0x140000000`，`SizeOfImage 0x1389000`，PE `TimeDateStamp 1561452115 (0x5D11DE53)`，SHA256 `3512D2A2…` | `EDF5-敌人血条-逆向线索与P0计划.md` |
 
 ## 6. 发布约定
 
