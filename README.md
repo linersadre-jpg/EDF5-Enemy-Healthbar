@@ -30,7 +30,7 @@ Native x64 C++ plugin loaded by [EDFModLoader](https://github.com/BlueAmulet/EDF
 >
 > Bug reports with the log file (`Mods\Plugins\EDF5EnemyHealthBar.log`, set `Debug=1`) are welcome.
 
-**Current version: `v1.2.0-pre` — pre-release, see [CHANGELOG.md](CHANGELOG.md).**
+**Current version: `v1.2.1-pre` — pre-release, see [CHANGELOG.md](CHANGELOG.md).**
 
 ---
 
@@ -63,6 +63,9 @@ Native x64 C++ plugin loaded by [EDFModLoader](https://github.com/BlueAmulet/EDF
 
 - 敌人头顶按血量百分比画血条（仅敌方、仅未满血、仅视野内）；
 - **遮挡检测**：被建筑/地形挡住就不画；**友军等角色单位不会遮蔽血条**；
+- **正在挨打的目标一定看得见**：最近 `ShowOnDamageSec` 秒内掉过血的敌人跳过遮挡判定；
+- **超大型目标多点采样**：只露出一部分（山丘后的传送塔）也照样显示；
+- **血条不会跑出画面**：屏幕内夹取 + 体型抬升上限（贴近巨型敌人 / 在洞穴里也正常）；
 - 血量读的是对象的 `+0x1F8`(最大) / `+0x1FC`(当前) —— 游戏伤害函数写回的**累积总生命值**；
 - 配置文件 `EDF5EnemyHealthBar.ini` 放在 DLL 同目录，改完重进关卡生效。
 
@@ -85,6 +88,16 @@ E:\SteamLibrary\steamapps\common\EARTH DEFENSE FORCE 5\Mods\Plugins\EDF5EnemyHea
 | `OcclusionIgnoreCharacters` | 1 | 友军/角色单位不算遮挡 |
 | `OcclusionReuse` | 2 | 遮挡结果分帧复用（同一对象每 N 帧才重投射线） |
 | `OcclusionSelfFrac` | 0.90 | 命中比例 ≥ 该值视为打到目标自身，不算遮挡（大型建筑型目标必需） |
+| `OcclusionSamples` | 0 | 遮挡射线采样点数；`0` = 自动（大目标 2 点，其余 1 点） |
+| `OcclusionSampleStep` | 12.0 | 额外采样点的抬升米数（自动模式乘体型系数，夹 1~4 倍） |
+| `OcclusionSampleMinHp` | 1000 | 自动模式门槛：最大血量 ≥ 该值才多点采样 |
+| `OcclusionFaultPolicy` | 0 | 射线异常时的策略：`0` = 保守（异常即暂停遮挡，换关卡再试） |
+| `ShowOnDamageSec` | 3.0 | 最近 N 秒内掉过血的敌人跳过遮挡判定（正在挨打的目标一定看得见） |
+| `BarScreenClamp` | 1 | 把血条屏幕位置夹在视口内（不会顶出画面） |
+| `BarOutlinePx` | 2 | 描边厚度（像素），0~4，可读性的关键之一 |
+| `BarColorMid` / `BarColorLow` | FFFF00 / FF0000 | 低血量 / 濒死时的颜色（配 `LowHpPercent` / `CriticalHpPercent`） |
+| `BarWidthByMaxHp` / `BarScaleByDistance` | 0 / 0 | 血条长度随最大血量、整体随距离自适应 |
+| `ToggleKey` | 0 | 三态热键的 VK 码（例 `0x77`=F8：全开 → 只采集不画 → 全关） |
 | `DrawFps` | 0 | 覆盖层重绘上限；`0` = 不限，跟随游戏帧 |
 | `MaxBars` | 64 | 同屏最多画几条 |
 | `Debug` | 1 | 往同目录写日志（日常玩建议设 0） |
@@ -120,8 +133,14 @@ copy build\EDF5EnemyHealthBar.dll "…\EARTH DEFENSE FORCE 5\Mods\Plugins\"
 
 1. **独占全屏下看不到血条**（分层窗口方案的固有代价）→ 用无边框窗口 / 窗口化。
 2. 联机、载具内、瞄准镜相机**均未验证**（见上文免责声明）。
-3. ~~传送塔这类"非冲突对象"没有血条~~ —— 已解决：传送塔的类名是 `GeneratorPoll`，它在敌方队伍里，缺条原因是遮挡自命中（见 `OcclusionSelfFrac`）。
-4. 血量的"总有效生命值 vs 部位耐久"口径，已用反汇编证据确认读的是前者，
+3. **稳定性仍在排查中**：作者环境里 90 天内出现过两次 `EDF5.exe` 崩溃（`0xC0000005`，2026-10-12 / 10-17），
+   都发生在游戏自己的物理侧代码、崩溃栈上没有本 MOD 的帧，**但本 MOD 无法因此被排除** ——
+   调用游戏射线时确实会在同一片代码里抛访问违例。v1.2.1 起默认采用**保守策略**
+   （`OcclusionFaultPolicy=0`：射线异常即暂停遮挡判定，切换关卡再试）。
+   崩溃在用户侧表现为"先卡死几秒、然后闪退"——那是 WER 收集转储时进程被挂起，属同一次崩溃的两个阶段。
+   详细取证见 [CHANGELOG.md](CHANGELOG.md) 的 v1.2.1 一节。
+4. ~~传送塔这类"非冲突对象"没有血条~~ —— 已解决：传送塔的类名是 `GeneratorPoll`，它在敌方队伍里，缺条原因是遮挡自命中（见 `OcclusionSelfFrac`）。
+5. 血量的"总有效生命值 vs 部位耐久"口径，已用反汇编证据确认读的是前者，
    但在多部位敌人（青蛙人 / 小灰人）上的**实机确认仍未完成**。
 
 ## License

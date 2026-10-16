@@ -34,9 +34,12 @@ HANDLE           g_snapEvent = nullptr;   // 游戏线程发布快照后 SetEven
 volatile LONG    g_pubCount  = 0;
 volatile LONG    g_drawCount = 0;
 volatile DWORD   g_pubTick   = 0;
+HANDLE           g_overlayThread = nullptr;   // 覆盖层线程句柄（GetThreadTimes 统计它的 CPU）
+volatile LONG64  g_overlayCpuTicks = 0;       // 覆盖层线程自测的 CPU 时间（100ns），由它自己更新
 
 static FILE* g_log = nullptr;
 static unsigned long long g_logBytes = 0;
+static DWORD g_logStart = 0;   // 会话起点（LogInit 时刻），用于给每行加"+秒数"前缀
 static CRITICAL_SECTION   g_logLock;
 static bool               g_logLockReady = false;
 constexpr unsigned long long kLogMaxBytes = 8ull * 1024 * 1024;   // 日志上限 8MB
@@ -55,6 +58,7 @@ void LogInit() {
 	// 无缓冲：进程如果被 /GS / 崩溃直接带走，缓冲区里的日志不会丢
 	if (g_log) setvbuf(g_log, nullptr, _IONBF, 0);
 	g_logBytes = 0;
+	g_logStart = GetTickCount();
 }
 
 void LogClose() {
@@ -73,11 +77,17 @@ void LogFlush() {
 
 void Log(const char* fmt, ...) {
 	if (!g_log || !g_logLockReady) return;
-	char buf[2048];
+	char msg[1900];
 	va_list ap;
 	va_start(ap, fmt);
-	_vsnprintf_s(buf, sizeof buf, _TRUNCATE, fmt, ap);
+	_vsnprintf_s(msg, sizeof msg, _TRUNCATE, fmt, ap);
 	va_end(ap);
+
+	// 每行都加"+进程内秒数"前缀：崩溃后只剩这一份日志时，
+	// 才能把日志时间线和 Windows 事件日志/WER 的绝对时间对齐（排查闪退必须）。
+	char buf[2048];
+	const double sec = static_cast<double>(GetTickCount() - g_logStart) / 1000.0;
+	_snprintf_s(buf, sizeof buf, _TRUNCATE, "[+%8.3f] %s", sec, msg);
 
 	// 连续打很多关也不会把日志写成几百 MB：超过上限就截断重开
 	EnterCriticalSection(&g_logLock);
@@ -225,6 +235,22 @@ void IniWriteDefault(const std::string& path) {
 		"OcclusionReuse=2\r\n"
 		"; 命中比例 >= 该值视为打到目标自身，不算遮挡（传送塔这类大型建筑型敌人必须放宽，否则会被自己挡住）\r\n"
 		"OcclusionSelfFrac=0.90\r\n"
+		"; ---- 遮挡采样与容错 ----\r\n"
+		"; 遮挡射线采样点数：0 = 自动（大目标 2 点，其余 1 点）；也可以手填 1~3。\r\n"
+		"; 目的：超大型目标只有一部分露在山丘/建筑外时，只要有一个采样点可见就画血条。\r\n"
+		"OcclusionSamples=0\r\n"
+		"; 每个额外采样点在世界上方抬升的基准米数（自动模式会乘体型系数，夹 1~4 倍）\r\n"
+		"OcclusionSampleStep=12.0\r\n"
+		"; 自动模式的门槛：最大血量 >= 该值的目标才做多点采样\r\n"
+		"OcclusionSampleMinHp=1000\r\n"
+		"; 射线异常（游戏物理内部抛 AV）时的处理：\r\n"
+		";   0 = 保守（默认）：异常一次就暂停遮挡射线，切换关卡后自动再试；整场累计 3 次则永久关闭\r\n"
+		";   1 = 旧行为：最多重试 3 次才永久关闭\r\n"
+		"OcclusionFaultPolicy=0\r\n"
+		"; 最近 N 秒内掉过血的敌人跳过遮挡判定（你正在打它，就一定看得见）。0 = 关掉\r\n"
+		"ShowOnDamageSec=3.0\r\n"
+		"; 1 = 把血条屏幕位置夹在视口内（近距离/洞穴里不会顶出画面）\r\n"
+		"BarScreenClamp=1\r\n"
 		"; ---- 颜色随血量 ----\r\n"
 		"; 血量 <= LowHpPercent 用 BarColorMid；<= CriticalHpPercent 用 BarColorLow\r\n"
 		"BarColorMid=FFFF00\r\n"
@@ -245,7 +271,12 @@ void IniWriteDefault(const std::string& path) {
 		"; 3 = 再加：按虚表 0xEC92F8 扫描进程私有内存，找出游戏自己的原生条实例\r\n"
 		"NativeProbe=0\r\n"
 		"; 0 = 不画我们自绘的覆盖层血条（采集与探针照常工作）。做原生条对照测试时设 0\r\n"
-		"DrawBars=1\r\n",
+		"DrawBars=1\r\n"
+		"; ---- 性能统计（排查「这个 MOD 吃了多少性能」时用）----\r\n"
+		"; 1 = 每 PerfIntervalMs 输出一组 [perf]：分阶段耗时(QPC) + 覆盖层线程 CPU(GetThreadTimes) + 帧间隔\r\n"
+		"PerfLog=0\r\n"
+		"; 统计窗口（毫秒）。3000 更细，5000 更稳\r\n"
+		"PerfIntervalMs=3000\r\n",
 		f);
 	fclose(f);
 }
@@ -283,6 +314,16 @@ void LoadConfig(const std::string& path) {
 	g_cfg.occlSelfFrac = ParseFloat(IniGet(path, "OcclusionSelfFrac", "0.90"), 0.90f);
 	if (g_cfg.occlSelfFrac < 0.5f) g_cfg.occlSelfFrac = 0.5f;
 	if (g_cfg.occlSelfFrac > 0.999f) g_cfg.occlSelfFrac = 0.999f;
+	g_cfg.occlSamples     = static_cast<int>(ParseInt(IniGet(path, "OcclusionSamples", "0"), 0));
+	if (g_cfg.occlSamples < 0) g_cfg.occlSamples = 0;
+	if (g_cfg.occlSamples > 3) g_cfg.occlSamples = 3;
+	g_cfg.occlSampleStep  = ParseFloat(IniGet(path, "OcclusionSampleStep", "12.0"), 12.0f);
+	if (g_cfg.occlSampleStep < 0.0f) g_cfg.occlSampleStep = 0.0f;
+	g_cfg.occlSampleMinHp = ParseFloat(IniGet(path, "OcclusionSampleMinHp", "1000"), 1000.0f);
+	g_cfg.occlFaultPolicy = static_cast<int>(ParseInt(IniGet(path, "OcclusionFaultPolicy", "0"), 0));
+	g_cfg.showOnDamageSec = ParseFloat(IniGet(path, "ShowOnDamageSec", "3.0"), 3.0f);
+	if (g_cfg.showOnDamageSec < 0.0f) g_cfg.showOnDamageSec = 0.0f;
+	g_cfg.screenClamp     = ParseInt(IniGet(path, "BarScreenClamp", "1"), 1) != 0;
 	g_cfg.colorMid    = ParseColor(IniGet(path, "BarColorMid", "FFFF00"), 0xFFFF00);
 	g_cfg.colorLow    = ParseColor(IniGet(path, "BarColorLow", "FF0000"), 0xFF0000);
 	g_cfg.lowHpPct    = ParseFloat(IniGet(path, "LowHpPercent", "60"), 60.0f);
@@ -303,6 +344,10 @@ void LoadConfig(const std::string& path) {
 	g_cfg.drawBars     = ParseInt(IniGet(path, "DrawBars", "1"), 1) != 0;
 	g_cfg.extraObjectScan = static_cast<int>(ParseInt(IniGet(path, "ExtraObjectScan", "0"), 0));
 	if (g_cfg.extraObjectScan < 0 || g_cfg.extraObjectScan > 2) g_cfg.extraObjectScan = 0;
+	g_cfg.perfLog        = ParseInt(IniGet(path, "PerfLog", "0"), 0) != 0;
+	g_cfg.perfIntervalMs = static_cast<int>(ParseInt(IniGet(path, "PerfIntervalMs", "5000"), 5000));
+	if (g_cfg.perfIntervalMs < 500)   g_cfg.perfIntervalMs = 500;
+	if (g_cfg.perfIntervalMs > 60000) g_cfg.perfIntervalMs = 60000;
 
 	if (g_cfg.barWidth  < 4)   g_cfg.barWidth = 4;
 	if (g_cfg.barWidth  > 400) g_cfg.barWidth = 400;
@@ -406,15 +451,30 @@ static bool CastRayHit(void* world, const float a[3], const float b[3], float* o
 // ---------------------------------------------------------------------------
 // 异常过滤器：把崩溃点写清楚，便于定位
 // ---------------------------------------------------------------------------
+static int  g_frame      = 0;   // Present 帧计数（只在游戏渲染线程改）
+
+// 射线异常现场：投射线**之前**填好，异常过滤器里只读这些普通变量，绝不碰游戏内存
+// （过滤器里再去解引用游戏对象，二次 AV 会直接带走进程）。
+static volatile LONG g_occlPaused    = 0;   // 1 = 本次运行已暂停遮挡射线（等关卡切换恢复）
+static std::uintptr_t g_rayCtxObj    = 0;
+static float          g_rayCtxDist   = 0.0f;
+static int            g_rayCtxSample = 0;
+static std::uintptr_t g_rayCtxWorld  = 0;
+static char           g_rayCtxClass[64] = "?";
+static int            g_levelGen     = 0;   // 关卡代号：队伍表清空时 +1
+
 static int EhFilter(LPEXCEPTION_POINTERS ep) {
 	static volatile LONG n = 0;
 	const LONG c = InterlockedIncrement(&n);
-	if (c <= 20) {
+	if (c <= 40) {
 		const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(ep->ExceptionRecord->ExceptionAddress);
-		Log("[!!] 采集异常 #%ld code=0x%08lX addr=%p (EDF5.exe+0x%llX)", c,
-		    static_cast<unsigned long>(ep->ExceptionRecord->ExceptionCode),
+		Log("[!!] 采集异常 #%ld code=0x%08lX addr=%p (EDF5.exe+0x%llX) 对象=%p class=%s 距离=%.1fm 采样=%d 世界=%p 帧=%d 关卡#%d",
+		    c, static_cast<unsigned long>(ep->ExceptionRecord->ExceptionCode),
 		    reinterpret_cast<void*>(addr),
-		    static_cast<unsigned long long>(addr - g_base));
+		    static_cast<unsigned long long>(addr - g_base),
+		    reinterpret_cast<void*>(g_rayCtxObj), g_rayCtxClass,
+		    static_cast<double>(g_rayCtxDist), g_rayCtxSample,
+		    reinterpret_cast<void*>(g_rayCtxWorld), g_frame, g_levelGen);
 		LogFlush();
 	}
 	return EXCEPTION_EXECUTE_HANDLER;
@@ -505,19 +565,28 @@ bool InstallHavokThread() {
 
 static bool SafeCastRay(void* world, const float a[3], const float b[3], float* outFrac,
                         std::uintptr_t* outObj = nullptr) {
-	if (g_occlBroken || !world) return false;
+	if (g_occlBroken || g_occlPaused || !world) return false;
 	if (!InstallHavokThread()) return false;
 
 	bool hit = false;
 	__try {
 		hit = CastRayHit(world, a, b, outFrac, outObj);
 	} __except (EhFilter(GetExceptionInformation())) {
-		// 单次异常不足以判死刑：换关卡/换世界时可能只是一次瞬时失效。
-		// 先丢缓存世界 + 重建私有 Havok 线程内存再试，连续 kOcclFaultLimit 次才永久关闭。
+		// 异常发生在游戏自己的物理代码里（0x74F13F / 0xB3DF85 / 0xB41307 都见过），
+		// 说明那个物理世界或线程现场已经被踩过。吞掉异常继续用同一套现场，风险在于
+		// 把游戏的数据结构悄悄搞坏，之后它自己走过去才崩（10-12 / 10-17 两次
+		// EDF5.exe 0xC0000005 就是这个形态：崩溃线程栈上没有我们的帧）。
+		// 所以默认策略（OcclusionFaultPolicy=0）是保守的：异常一次立刻停投射线，
+		// 等下一次关卡切换（世界重建）再给一次机会；整场累计 kOcclFaultLimit 次就永久关闭。
 		const LONG n = InterlockedIncrement(&g_occlFaults);
-		if (n < kOcclFaultLimit) {
+		InterlockedExchange(&g_worldRestale, 1);
+		if (g_cfg.occlFaultPolicy <= 0) {
+			if (InterlockedExchange(&g_occlPaused, 1) == 0)
+				Log("[occl] 射线异常第 %ld 次：按保守策略（OcclusionFaultPolicy=0）暂停遮挡射线，切换关卡后自动再试一次", n);
+			if (n >= kOcclFaultLimit && InterlockedExchange(&g_occlBroken, 1) == 0)
+				Log("[occl] 射线累计异常 %ld 次，本次运行永久关闭遮挡检测", n);
+		} else if (n < kOcclFaultLimit) {
 			Log("[occl] 射线异常第 %ld 次：丢弃缓存世界并重建 Havok 线程内存后继续", n);
-			InterlockedExchange(&g_worldRestale, 1);
 			InterlockedExchange(&g_havokState, 0);
 		} else if (InterlockedExchange(&g_occlBroken, 1) == 0) {
 			Log("[occl] 射线连续异常 %ld 次，本次运行永久关闭遮挡检测", n);
@@ -531,6 +600,18 @@ static bool SafeCastRay(void* world, const float a[3], const float b[3], float* 
 		LogFlush();
 	}
 	return hit;
+}
+
+// 关卡切换（队伍表清空）：世界会被重建，射线现场也跟着换。给遮挡射线一次全新的机会。
+// 注意：这里**不**重建私有 Havok 线程内存——它属于本进程，反复构造会在游戏的
+// hkMemorySystem 里反复登记同一块内存（慢速泄漏）。只在世界这一侧重置即可。
+static void OcclLevelChanged() {
+	++g_levelGen;
+	if (InterlockedExchange(&g_occlPaused, 0) == 1) {
+		const LONG f = InterlockedCompareExchange(&g_occlFaults, 0, 0);
+		Log("[occl] 关卡切换（第 %d 关）：恢复遮挡射线（本场累计异常 %ld 次）", g_levelGen, f);
+		InterlockedExchange(&g_worldRestale, 1);
+	}
 }
 
 // 物理世界缓存
@@ -688,15 +769,18 @@ static int CollectEnemies(std::uintptr_t player, std::uintptr_t* out, int cap) {
 static void ToggleHotkey() {
 	if (g_cfg.toggleKey <= 0) return;
 	static bool down = false;
+	static int  state = 0;                 // 0=全开 1=只采集不画 2=全关
 	const bool now = (GetAsyncKeyState(g_cfg.toggleKey) & 0x8000) != 0;
 	if (now && !down) {
-		g_cfg.enabled = !g_cfg.enabled;
-		Log("[hotkey] 血条 %s", g_cfg.enabled ? "开启" : "关闭");
+		state = (state + 1) % 3;
+		g_cfg.enabled  = (state != 2);
+		g_cfg.drawBars = (state == 0);
+		Log("[hotkey] 血条 状态=%d（%s）", state,
+		    state == 0 ? "全开" : (state == 1 ? "只采集不画（等效 DrawBars=0）" : "全关"));
 	}
 	down = now;
 }
 
-static int  g_frame      = 0;   // Present 帧计数（只在游戏渲染线程改）
 static int  g_occlUsed   = 0;
 static int  g_occlDropped = 0;  // 本帧因遮挡被丢掉的条数
 static int  g_occlDropLog = 0;  // 遮挡案例的日志预算
@@ -1175,6 +1259,42 @@ static int OcclAdd(std::uintptr_t o) {
 	return i;
 }
 
+// ---------------------------------------------------------------------------
+// "最近在掉血"记录：正在挨打的目标一定看得见，不该被遮挡判定吃掉。
+// 场景（用户实测）：超大型传送塔站在山丘后面，只露出顶部，玩家正打它露出的部分，
+// 但射线打向塔的锚点被山丘挡住 → 血条不显示。这一类"我在打它它却不给我看"的情况，
+// 用"最近 N 秒内掉过血"直接放行，比再加射线更便宜也更准。
+constexpr int kDmgSlots = 256;
+static std::uintptr_t g_dmgObj[kDmgSlots]  = {};
+static float          g_dmgLast[kDmgSlots] = {};
+static DWORD          g_dmgTick[kDmgSlots] = {};
+static int            g_dmgCount = 0;
+
+// 每帧、每个通过血量过滤的敌人调用一次（必须在遮挡判定之前）
+static void NoteDamage(std::uintptr_t o, float curHp, DWORD now) {
+	for (int i = 0; i < g_dmgCount; ++i) {
+		if (g_dmgObj[i] != o) continue;
+		if (curHp < g_dmgLast[i] - 0.001f) g_dmgTick[i] = now;   // 掉血了
+		g_dmgLast[i] = curHp;
+		return;
+	}
+	if (g_dmgCount < kDmgSlots) {
+		const int i = g_dmgCount++;
+		g_dmgObj[i]  = o;
+		g_dmgLast[i] = curHp;
+		g_dmgTick[i] = 0;
+	}
+}
+
+static bool RecentlyDamaged(std::uintptr_t o, DWORD now, DWORD windowMs) {
+	if (windowMs == 0) return false;
+	for (int i = 0; i < g_dmgCount; ++i) {
+		if (g_dmgObj[i] != o) continue;
+		return g_dmgTick[i] != 0 && (now - g_dmgTick[i]) < windowMs;
+	}
+	return false;
+}
+
 // 队伍表全量 dump：NativeProbe=4 时，把每个队伍里的对象连同类名/血量/坐标打出来，
 // 用来排查"某类敌人（例如传送塔）为什么不显示血条"。
 static void DebugDumpTeams(std::uintptr_t player) {
@@ -1360,7 +1480,113 @@ static void ExtraScanStep(bool inMission) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 性能统计（PerfLog=1）——用于回答"这个 MOD 到底吃了多少性能"
+// 渲染线程：QPC 分阶段计时（前置+遍历 / 逐对象循环 / 循环内的遮挡射线 / 快照发布）
+// 覆盖层线程：GetThreadTimes 直接量它自己的 CPU（两个线程同在一个进程里，没有别的方法区分）
+// 自身开销：每帧几次 QPC（每次约 20~30ns）+ 每窗口一次 GetThreadTimes ≈ 0.02ms/帧，可忽略
+// ---------------------------------------------------------------------------
+struct PerfState {
+	long long collectTicks = 0, enumTicks = 0, occlTicks = 0, pubTicks = 0;
+	long long collectMax = 0;
+	long long rays = 0, barsSum = 0;
+	int       barsMax = 0;
+	long long collectFrames = 0, presentFrames = 0;
+	long long gapTicks = 0, gapMaxTicks = 0, gapSamples = 0;
+	long long over1ms = 0, over2ms = 0;
+	long long drawBase = 0;
+	long long lastCpuTicks = 0;
+	long long winStartTicks = 0;
+};
+static PerfState g_pf;
+static double    g_qpcMsPerTick = 0.0;
+static bool      g_pfReady = false;
+static long long g_lastPresentTicks = 0;
+
+static long long QpcNow() {
+	LARGE_INTEGER t;
+	QueryPerformanceCounter(&t);
+	return t.QuadPart;
+}
+static double TicksToMs(long long t) { return static_cast<double>(t) * g_qpcMsPerTick; }
+
+static long long OverlayCpuTicks() {
+	// 覆盖层线程自己在每轮循环里用 GetCurrentThread() 采样后写进这个全局。
+	// （实测：让游戏线程拿线程句柄调 GetThreadTimes 恒返回 0 —— 那个写法是错的）
+	return static_cast<long long>(g_overlayCpuTicks);
+}
+
+static void PerfInit() {
+	LARGE_INTEGER f;
+	QueryPerformanceFrequency(&f);
+	g_qpcMsPerTick = (f.QuadPart > 0) ? (1000.0 / static_cast<double>(f.QuadPart)) : 0.0;
+	g_pf.winStartTicks = QpcNow();
+	g_pf.lastCpuTicks  = OverlayCpuTicks();
+	g_pf.drawBase      = g_drawCount;
+	g_pfReady = true;
+}
+
+static void PerfMaybeLog(long long nowTicks) {
+	if (!g_pfReady || g_qpcMsPerTick <= 0.0) return;
+	const double winMs = TicksToMs(nowTicks - g_pf.winStartTicks);
+	if (winMs < static_cast<double>(g_cfg.perfIntervalMs)) return;
+
+	const long long cpuNow  = OverlayCpuTicks();
+	const double    ovlCpuMs = static_cast<double>(cpuNow - g_pf.lastCpuTicks) / 10000.0;
+	g_pf.lastCpuTicks = cpuNow;
+	const long long draws    = g_drawCount;
+	const long long drawsWin = draws - g_pf.drawBase;
+	g_pf.drawBase = draws;
+
+	const double nf = static_cast<double>(g_pf.collectFrames > 0 ? g_pf.collectFrames : 1);
+	const double sec = (winMs > 1.0) ? winMs / 1000.0 : 0.001;
+
+	Log("[perf] %.1fs St=%d 帧=%lld(%.1ffps) 采集帧=%lld 条 平均=%.1f 最大=%d",
+	    winMs / 1000.0, !g_cfg.enabled ? 2 : (g_cfg.drawBars ? 0 : 1), g_pf.presentFrames,
+	    static_cast<double>(g_pf.presentFrames) / sec, g_pf.collectFrames,
+	    static_cast<double>(g_pf.barsSum) / nf, g_pf.barsMax);
+	Log("[perf]   采集 平均=%.3f 最大=%.3f ms | 遍历=%.3f 遮挡=%.3f (%.0f 条/帧, %.1f us/条) 发布=%.3f ms",
+	    TicksToMs(g_pf.collectTicks) / nf, TicksToMs(g_pf.collectMax),
+	    TicksToMs(g_pf.enumTicks) / nf,
+	    TicksToMs(g_pf.occlTicks) / nf,
+	    static_cast<double>(g_pf.rays) / nf,
+	    (g_pf.rays > 0) ? TicksToMs(g_pf.occlTicks) * 1000.0 / static_cast<double>(g_pf.rays) : 0.0,
+	    TicksToMs(g_pf.pubTicks) / nf);
+	Log("[perf]   帧间隔 平均=%.2f 最大=%.2f ms | 覆盖层线程 CPU=%.1f ms/s 重绘=%.1f /s | 超预算帧 >1ms=%lld >2ms=%lld",
+	    (g_pf.gapSamples > 0) ? TicksToMs(g_pf.gapTicks) / static_cast<double>(g_pf.gapSamples) : 0.0,
+	    TicksToMs(g_pf.gapMaxTicks),
+	    ovlCpuMs / sec,
+	    static_cast<double>(drawsWin) / sec,
+	    g_pf.over1ms, g_pf.over2ms);
+
+	g_pf.collectTicks = g_pf.enumTicks = g_pf.occlTicks = g_pf.pubTicks = 0;
+	g_pf.collectMax = 0;
+	g_pf.rays = 0; g_pf.barsSum = 0; g_pf.barsMax = 0;
+	g_pf.collectFrames = 0; g_pf.presentFrames = 0;
+	g_pf.gapTicks = 0; g_pf.gapMaxTicks = 0; g_pf.gapSamples = 0;
+	g_pf.over1ms = 0; g_pf.over2ms = 0;
+	g_pf.winStartTicks = nowTicks;
+	LogFlush();
+}
+
+// 每个 Present 都调用：量游戏自己的帧间隔，并在窗口结束时输出统计
+static void PerfPresent() {
+	if (!g_cfg.perfLog) return;
+	if (!g_pfReady) PerfInit();
+	const long long t = QpcNow();
+	if (g_lastPresentTicks != 0) {
+		const long long d = t - g_lastPresentTicks;
+		g_pf.gapTicks += d;
+		++g_pf.gapSamples;
+		if (d > g_pf.gapMaxTicks) g_pf.gapMaxTicks = d;
+	}
+	g_lastPresentTicks = t;
+	++g_pf.presentFrames;
+	PerfMaybeLog(t);
+}
+
 static void CollectFrame() {
+	const long long tFrame0 = g_cfg.perfLog ? QpcNow() : 0;
 	ToggleHotkey();
 
 	if (!g_cfg.enabled) {
@@ -1406,6 +1632,7 @@ static void CollectFrame() {
 
 	std::uintptr_t enemies[256];
 	const int n = CollectEnemies(player, enemies, 256);
+	const long long tEnum = g_cfg.perfLog ? QpcNow() : 0;
 	g_registry = n;
 	NativeBarProbe(player, enemies, n);
 
@@ -1418,6 +1645,8 @@ static void CollectFrame() {
 		g_hpLines = 0;
 		g_barCount = 0;
 		g_occlDropLog = 0;
+		g_dmgCount = 0;
+		OcclLevelChanged();
 		Log("[life] 关卡切换（队伍表清空）：已清空遮挡缓存与取证表");
 	}
 	g_prevObjCount = n;
@@ -1454,6 +1683,11 @@ static void CollectFrame() {
 	int occl = 0;
 	g_occlDropped = 0;
 
+	// "最近在掉血"窗口：正在挨打的目标跳过遮挡判定
+	const DWORD nowTick = GetTickCount();
+	const DWORD dmgWindowMs = (g_cfg.showOnDamageSec > 0.0f)
+	    ? static_cast<DWORD>(g_cfg.showOnDamageSec * 1000.0f) : 0u;
+
 	const float maxAngle = g_cfg.maxViewAngle;
 	const float cosLimit = std::cos(maxAngle * 3.14159265358979f / 180.0f);
 
@@ -1465,6 +1699,7 @@ static void CollectFrame() {
 		if (!RdF(o + off::kMaxHp, maxHp) || !RdF(o + off::kCurHp, curHp)) continue;
 		if (!(maxHp > 0.0f)) continue;
 		NoteHealth(o, maxHp, curHp);
+		NoteDamage(o, curHp, nowTick);          // 必须在遮挡判定之前：掉血的目标要能立刻放行
 		if (!(curHp > 0.0f)) continue;          // 已死亡
 		if (!(curHp < maxHp)) continue;         // 满血不画
 
@@ -1486,11 +1721,13 @@ static void CollectFrame() {
 		}
 
 		// 巨型敌人：抬升量随最大血量放大（以普通兵 81 血为基准）
+		// 上限从 10 收到 3：用户实测怪物贴近时（尤其洞穴里）大血量目标会被抬到画面外，
+		// 3 倍已经足够让巨型/Boss 的血条离开身体，再高只会顶出视野。
 		float scale = 1.0f;
 		if (g_cfg.scaleHeight) {
 			scale = std::sqrt(maxHp / 81.0f);
 			if (scale < 1.0f) scale = 1.0f;
-			if (scale > 10.0f) scale = 10.0f;
+			if (scale > 3.0f) scale = 3.0f;
 		}
 		anchor[1] += g_cfg.heightOffset * scale;
 
@@ -1516,37 +1753,65 @@ static void CollectFrame() {
 		// 遮挡：只在已经通过前面所有过滤的敌人身上做射线。
 		// 射线终点必须往回收一点：直接打到敌人头顶会命中敌人自己的碰撞体，
 		// 结果就是"永远判定为被遮挡、血条全都不画"（实测 13 条射线 0 条血条）。
-		if (g_cfg.occlusion && g_world && eyeOk && !g_occlBroken) {
+		const long long tOccl = g_cfg.perfLog ? QpcNow() : 0;
+		// 正在挨打的目标一定看得见：跳过遮挡判定（见 NoteDamage 的说明）
+		const bool hurtNow = RecentlyDamaged(o, nowTick, dmgWindowMs);
+		if (g_cfg.occlusion && g_world && eyeOk && !g_occlBroken && !hurtNow) {
 			int slot = OcclFind(o);
 			bool blocked = false;
 			if (slot >= 0 && (g_frame - g_occlSlotFrame[slot]) < g_cfg.occlReuse) {
 				blocked = (g_occlSlotBlocked[slot] != 0);   // 沿用上次结果，本帧不投射线
 			} else {
-				++occl;
-				const float dx = anchor[0] - eye[0];
-				const float dy = anchor[1] - eye[1];
-				const float dz = anchor[2] - eye[2];
-				const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-				float to[3] = { anchor[0], anchor[1], anchor[2] };
-				if (dist > g_cfg.occlBackoff + 0.1f) {
-					const float k = (dist - g_cfg.occlBackoff) / dist;
-					to[0] = eye[0] + dx * k;
-					to[1] = eye[1] + dy * k;
-					to[2] = eye[2] + dz * k;
+				// 采样点数：0 = 自动（大目标多点，普通目标 1 点）。
+				// 目的：超大型目标只有一部分露在山丘/建筑外时，只要有一个采样点可见就画血条。
+				int samples = g_cfg.occlSamples;
+				if (samples <= 0) samples = (maxHp >= g_cfg.occlSampleMinHp) ? 2 : 1;
+				if (samples < 1) samples = 1;
+				if (samples > 3) samples = 3;
+				float step = (g_cfg.occlSampleStep > 0.0f) ? g_cfg.occlSampleStep : 0.0f;
+				{
+					float sz = std::sqrt(maxHp / 81.0f);   // 体型系数（以 81 血普通兵为基准）
+					if (sz < 1.0f) sz = 1.0f;
+					if (sz > 4.0f) sz = 4.0f;
+					step *= sz;
 				}
-				float frac = -1.0f;
-				std::uintptr_t hitObj = 0;
-				if (SafeCastRay(g_world, eye, to, &frac, &hitObj) && frac < g_cfg.occlSelfFrac) {
-					const bool isChar = HitLooksLikeCharacter(hitObj);
-					if (g_cfg.debug && g_occlDropLog < 40) {
-						++g_occlDropLog;
-						Log("[occl] 挡住 %p class=%s 距离=%.1fm 命中比例=%.4f 命中对象=%p class=%s 判为角色=%d",
-						    reinterpret_cast<void*>(o), ClassTag(o).c_str(),
-						    static_cast<double>(dist), static_cast<double>(frac),
-						    reinterpret_cast<void*>(hitObj), ClassTag(hitObj).c_str(), isChar ? 1 : 0);
+				for (int s = 0; s < samples; ++s) {
+					const float want[3] = { anchor[0], anchor[1] + step * static_cast<float>(s), anchor[2] };
+					const float dx = want[0] - eye[0];
+					const float dy = want[1] - eye[1];
+					const float dz = want[2] - eye[2];
+					const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+					if (dist < 0.5f) continue;
+					float to[3] = { want[0], want[1], want[2] };
+					if (dist > g_cfg.occlBackoff + 0.1f) {
+						const float k = (dist - g_cfg.occlBackoff) / dist;
+						to[0] = eye[0] + dx * k;
+						to[1] = eye[1] + dy * k;
+						to[2] = eye[2] + dz * k;
 					}
-					// 友军/任何角色单位都不算遮挡（用户明确要求）；只有地图/建筑/地形才丢条
-					if (!(g_cfg.occlIgnoreChars && isChar)) blocked = true;
+					++occl;
+					g_rayCtxObj    = o;
+					g_rayCtxDist   = dist;
+					g_rayCtxSample = s;
+					g_rayCtxWorld  = reinterpret_cast<std::uintptr_t>(g_world);
+					// 异常现场要带类名：这里多解一次 RTTI（每帧最多十几次，可忽略），
+					// 换来"异常日志里到底是谁触发的"这个关键信息（不加就只能看到一堆地址）。
+					_snprintf_s(g_rayCtxClass, sizeof g_rayCtxClass, _TRUNCATE, "%s", ClassTag(o).c_str());
+					float frac = -1.0f;
+					std::uintptr_t hitObj = 0;
+					if (SafeCastRay(g_world, eye, to, &frac, &hitObj) && frac < g_cfg.occlSelfFrac) {
+						const bool isChar = HitLooksLikeCharacter(hitObj);
+						if (g_cfg.debug && g_occlDropLog < 40) {
+							++g_occlDropLog;
+							Log("[occl] 挡住 %p class=%s 距离=%.1fm 采样=%d 命中比例=%.4f 命中对象=%p class=%s 判为角色=%d",
+							    reinterpret_cast<void*>(o), ClassTag(o).c_str(),
+							    static_cast<double>(dist), s, static_cast<double>(frac),
+							    reinterpret_cast<void*>(hitObj), ClassTag(hitObj).c_str(), isChar ? 1 : 0);
+						}
+						// 友军/任何角色单位都不算遮挡（用户明确要求）；只有地图/建筑/地形才丢条
+						if (!(g_cfg.occlIgnoreChars && isChar)) blocked = true;
+					}
+					if (!blocked) break;   // 有任何一个采样点可见就不算被遮挡
 				}
 				if (slot < 0) slot = OcclAdd(o);
 				if (slot >= 0) {
@@ -1556,9 +1821,11 @@ static void CollectFrame() {
 			}
 			if (blocked) {
 				++g_occlDropped;
+				if (g_cfg.perfLog) g_pf.occlTicks += QpcNow() - tOccl;
 				continue;
 			}
 		}
+		if (g_cfg.perfLog) g_pf.occlTicks += QpcNow() - tOccl;
 
 		BarRect& b = tmp[count++];
 		NoteBar(o, maxHp, curHp);
@@ -1581,6 +1848,15 @@ static void CollectFrame() {
 		b.h = bh;
 		b.x = pa.sx - b.w * 0.5f;
 		b.y = pa.sy - b.h - 2.0f;
+		// 屏幕内夹取：近距离/洞穴里锚点会投影到画面外（或贴着上边缘），
+		// 不夹的话血条就直接看不见了。夹到视口内至少还能看见它在哪。
+		if (g_cfg.screenClamp) {
+			const float m = 8.0f;
+			if (b.x < m) b.x = m;
+			if (b.y < m) b.y = m;
+			if (b.x + b.w > static_cast<float>(winW) - m) b.x = static_cast<float>(winW) - m - b.w;
+			if (b.y + b.h > static_cast<float>(winH) - m) b.y = static_cast<float>(winH) - m - b.h;
+		}
 		b.frac = curHp / maxHp;
 		if (b.frac < 0.0f) b.frac = 0.0f;
 		if (b.frac > 1.0f) b.frac = 1.0f;
@@ -1592,9 +1868,11 @@ static void CollectFrame() {
 
 	g_occlUsed = occl;
 
+	const long long tPub = g_cfg.perfLog ? QpcNow() : 0;
 	EnterCriticalSection(&g_snapLock);
 	g_snap.screenW = winW;
 	g_snap.screenH = winH;
+	const int barsBuilt = count;      // DrawBars=0 时也要统计，否则性能数据失真
 	if (!g_cfg.drawBars) count = 0;   // 只关掉自绘，采集/探针不受影响
 	if (count > kMaxBars) count = kMaxBars;
 	g_snap.count = count;
@@ -1605,6 +1883,22 @@ static void CollectFrame() {
 	if (g_snapEvent) SetEvent(g_snapEvent);
 	InterlockedIncrement(&g_pubCount);
 	g_pubTick = GetTickCount();
+
+	if (g_cfg.perfLog) {
+		const long long tEnd  = QpcNow();
+		const long long total = tEnd - tFrame0;
+		g_pf.collectTicks += total;
+		g_pf.enumTicks    += (tEnum - tFrame0);
+		g_pf.pubTicks     += (tEnd - tPub);
+		g_pf.rays         += g_occlUsed;
+		g_pf.barsSum      += barsBuilt;
+		if (barsBuilt > g_pf.barsMax) g_pf.barsMax = barsBuilt;
+		++g_pf.collectFrames;
+		if (total > g_pf.collectMax) g_pf.collectMax = total;
+		const double ms = TicksToMs(total);
+		if (ms > 1.0) ++g_pf.over1ms;
+		if (ms > 2.0) ++g_pf.over2ms;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1652,6 +1946,7 @@ static HRESULT STDMETHODCALLTYPE HookPresent(void* swapChain, UINT syncInterval,
 	DWORD fgPid = 0;
 	if (fgWnd) GetWindowThreadProcessId(fgWnd, &fgPid);
 	const bool gameFocused = (fgWnd == nullptr) || (fgPid == GetCurrentProcessId());
+	PerfPresent();   // 性能统计：量帧间隔并在窗口结束时输出 [perf]
 	if (gameFocused && now - g_lastFrame >= interval) {
 		g_lastFrame = now;
 		++g_frame;
@@ -1692,18 +1987,30 @@ static bool InstallPresentHook() {
 static DWORD WINAPI InitThread(LPVOID) {
 	LogInit();
 	Log("================ EDF5 敌人血条 MOD ================");
+	{
+		SYSTEMTIME st = {};
+		GetLocalTime(&st);
+		Log("会话开始 本地时间 %04d-%02d-%02d %02d:%02d:%02d（下面每行前缀就是距此刻的秒数，"
+		    "排查闪退时用它和系统事件日志对齐）",
+		    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	}
 	Log("base=%p end=%p dir=%s", reinterpret_cast<void*>(g_base), reinterpret_cast<void*>(g_baseEnd), g_dir.c_str());
-	Log("构建标记: EHB-1.2.0 (性能版：Readable 区间缓存；覆盖层只擦旧条/只传脏区/内容未变则跳过；DrawFps=0 跟随游戏帧)");
+	Log("构建标记: EHB-1.2.1 (稳定性与显示修正版：射线异常保守策略 + 异常现场取证；最近掉血目标放行；大目标遮挡多点采样；血条屏幕内夹取；日志带秒数前缀)");
 	Log("尺寸自检: DXGI_SWAP_CHAIN_DESC=%zu Collector=%zu RayQuery=%zu BarRect=%zu",
 	    sizeof(DXGI_SWAP_CHAIN_DESC), sizeof(Collector), sizeof(RayQuery), sizeof(BarRect));
 
 	LoadConfig(g_dir + "\\EDF5EnemyHealthBar.ini");
+	Log("perf: PerfLog=%d 窗口=%dms", g_cfg.perfLog, g_cfg.perfIntervalMs);
 	Log("config: Enabled=%d Color=%06X %dx%d MaxViewAngle=%.1f Occlusion=%d HeightOffset=%.2f MaxBars=%d DrawFps=%d Debug=%d",
 	    g_cfg.enabled, g_cfg.color, g_cfg.barWidth, g_cfg.barHeight, g_cfg.maxViewAngle,
 	    g_cfg.occlusion, g_cfg.heightOffset, g_cfg.maxBars, g_cfg.drawFps, g_cfg.debug);
 	Log("config2: MaxDistance=%.1f MinScreenSize=%.1f OcclBackoff=%.2f OcclIgnoreChars=%d RayFilter=0x%X EyeHeight=%.2f UseLockOn=%d ScaleHeight=%d NativeProbe=%d",
 	    g_cfg.maxDistance, g_cfg.minScreenSize, g_cfg.occlBackoff, g_cfg.occlIgnoreChars, g_cfg.rayFilter,
 	    g_cfg.eyeHeight, g_cfg.useLockOn, g_cfg.scaleHeight, g_cfg.nativeProbe);
+	Log("config3: OcclReuse=%d OcclSelfFrac=%.3f OcclSamples=%d OcclSampleStep=%.1f OcclSampleMinHp=%.0f OcclFaultPolicy=%d ShowOnDamageSec=%.1f BarScreenClamp=%d",
+	    g_cfg.occlReuse, static_cast<double>(g_cfg.occlSelfFrac), g_cfg.occlSamples,
+	    static_cast<double>(g_cfg.occlSampleStep), static_cast<double>(g_cfg.occlSampleMinHp),
+	    g_cfg.occlFaultPolicy, static_cast<double>(g_cfg.showOnDamageSec), g_cfg.screenClamp);
 
 	// 覆盖层窗口（独立线程）
 	OverlayStart(nullptr);
@@ -1740,7 +2047,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
 extern "C" BOOL __declspec(dllexport) EDFMLAPI EML5_Load(PluginInfo* pluginInfo) {
 	pluginInfo->infoVersion = PluginInfo::MaxInfoVer;
 	pluginInfo->name        = "EDF5 Enemy Healthbar";
-	pluginInfo->version     = PLUG_VER(1, 2, 0, 0);
+	pluginInfo->version     = PLUG_VER(1, 2, 1, 0);
 
 	char path[MAX_PATH] = {};
 	GetModuleFileNameA(g_self, path, MAX_PATH);
@@ -1765,6 +2072,6 @@ extern "C" BOOL __declspec(dllexport) EDFMLAPI EML5_Load(PluginInfo* pluginInfo)
 	}
 
 	InitializeCriticalSection(&g_snapLock);
-	CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
+	g_overlayThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
 	return TRUE;
 }

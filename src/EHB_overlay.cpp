@@ -157,6 +157,18 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
 	while (!g_ovStop) {
 		const DWORD now = GetTickCount();
 
+		// 自己的 CPU 时间（100ns）：对自己用 GetCurrentThread() 伪句柄最可靠。
+		// 让游戏线程拿句柄去查会恒为 0（实测），所以计数在这里更新。
+		{
+			FILETIME ct, et, kt, ut;
+			if (GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut)) {
+				ULARGE_INTEGER kk, uu;
+				kk.LowPart = kt.dwLowDateTime;  kk.HighPart = kt.dwHighDateTime;
+				uu.LowPart = ut.dwLowDateTime;  uu.HighPart = ut.dwHighDateTime;
+				g_overlayCpuTicks = static_cast<LONG64>(kk.QuadPart + uu.QuadPart);
+			}
+		}
+
 		MSG msg;
 		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
@@ -288,12 +300,15 @@ static DWORD WINAPI OverlayThreadProc(LPVOID) {
 			static LONG lastPub = 0, lastDraws = 0;
 			const LONG pub  = InterlockedCompareExchange(&g_pubCount, 0, 0);
 			const LONG drw  = InterlockedCompareExchange(&g_drawCount, 0, 0);
-			const DWORD age = now - g_pubTick;   // 画的时候快照已经多旧
+			// g_pubTick==0 = 还没发布过快照；用有符号差值，避免无符号回绕出现 4294967280ms
+			const long long age = (g_pubTick == 0)
+				? -1
+				: (static_cast<long long>(now) - static_cast<long long>(g_pubTick));
 			lastDrawLog = now;
-			Log("[draw] 条数=%d 覆盖层=%dx%d@(%ld,%ld) 渲染=%dx%d 游戏窗口=%p OverlayMode=%d | 发布=%d 绘制=%d 快照年龄=%lums",
+			Log("[draw] 条数=%d 覆盖层=%dx%d@(%ld,%ld) 渲染=%dx%d 游戏窗口=%p OverlayMode=%d | 发布=%d 绘制=%d 快照年龄=%lldms",
 			    count, cw, ch, origin.x, origin.y, dispW, dispH,
 			    reinterpret_cast<void*>(cachedGame), g_cfg.overlayMode,
-			    pub - lastPub, drw - lastDraws, static_cast<unsigned long>(age));
+			    pub - lastPub, drw - lastDraws, age);
 			lastPub = pub;
 			lastDraws = drw;
 		}

@@ -106,6 +106,12 @@ struct Config {
 	int      occlIgnoreChars= 1;       // 1 = 角色单位（含友军）不算遮挡，只有地图/建筑才挡血条
 	int      occlReuse      = 2;
 	float    occlSelfFrac   = 0.90f;   // 命中比例 >= 该值视为打到目标自身，不算遮挡（大型建筑型敌人必须放宽）       // 遮挡结果分帧复用：同一对象每 N 帧才重投一次射线（1=每帧都投）
+	int      occlSamples    = 0;       // 遮挡采样点数：0=自动（大目标 2 点，其余 1 点）；1~3=手动
+	float    occlSampleStep = 12.0f;   // 每个额外采样点在世界上方抬升的基准米数（自动模式乘体型系数，夹 1~4 倍）
+	float    occlSampleMinHp= 1000.0f; // 自动模式门槛：最大血量 >= 该值的目标才做多点采样
+	int      occlFaultPolicy= 0;       // 射线异常策略：0=保守（异常即暂停，切关卡再试，累计 3 次整场关闭）；1=旧行为
+	float    showOnDamageSec= 3.0f;    // 最近 N 秒内掉过血的目标跳过遮挡判定（正在打它 => 一定看得见）；0=关
+	int      screenClamp    = 1;       // 1 = 血条屏幕位置夹在视口内（近距离/洞穴里不顶出画面）
 	int      extraObjectScan= 0;       // 1 = 分帧扫描"带血量块"的表外目标（如传送塔）；2 = 并绘制出来
 	uint32_t colorMid       = 0xFFFF00;// 中等血量颜色（黄）
 	uint32_t colorLow       = 0xFF0000;// 低血量颜色（红）
@@ -118,9 +124,12 @@ struct Config {
 	int      debug          = 0;
 	int      nativeProbe    = 0;       // C1 只读探针：1=dump 字段/容器 2=再加 SoldierBase 测试 3=再加虚表扫描
 	int      drawBars       = 1;       // 0 = 不画我们自绘的覆盖层血条（采集/探针继续跑），用于原生条对照测试
+	int      perfLog        = 0;       // 1 = 输出 [perf] 性能统计（分阶段 QPC 计时 + 覆盖层线程 CPU）
+	int      perfIntervalMs = 5000;    // 性能统计窗口（毫秒）
 };
 
 extern Config g_cfg;
+extern volatile LONG64 g_overlayCpuTicks;   // 覆盖层线程自测的 CPU 时间（100ns，由它自己更新）
 
 // ---------------------------------------------------------------------------
 // 快照（游戏线程写，覆盖层线程读）
